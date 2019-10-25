@@ -294,11 +294,11 @@ class AutoML():
             verbose=False)
         if X.shape[0] >= 20000:
             X_train, X_test, y_train, y_test = train_test_split(
-                X_check.sample(n=X.shape[1] * 10, random_state=0).copy(),
+                X_check.fillna(0).sample(n=X.shape[1] * 10, random_state=0).copy(),
                 y.sample(n=X.shape[1] * 10, random_state=0).copy(),
                 test_size=0.33, random_state=0)
         else:
-            X_train, X_test, y_train, y_test = train_test_split(X_check.copy(),
+            X_train, X_test, y_train, y_test = train_test_split(X_check.fillna(0).copy(),
                                                                 y.copy(),
                                                                 test_size=0.33, random_state=0)
 
