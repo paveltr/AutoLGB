@@ -248,7 +248,7 @@ class AutoML():
         print('Data shape: ', data_shape)
 
         if type(X) != pd.DataFrame:
-            X = pd.DataFrame(X, columns=[str(c) for c in range(X.shape[1])])
+            X = pd.DataFrame(X, columns=[str(c) for c in range(X.shape[1])]).fillna(0)
         if type(y) != pd.Series:
             y = pd.Series(y)
 
@@ -541,7 +541,7 @@ class AutoML():
         Makes predictions
         @X => dataframe with features
         '''
-        data = self.process_data(X.copy())
+        data = self.process_data(X.copy()).fillna(0)
         preds = np.zeros(X.shape[0])
         for m in tqdm(self.model):
             if self.task_type == 'binary_classification':
