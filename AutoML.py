@@ -103,7 +103,22 @@ def pca_encode(X, pca_enc):
 
 
 def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_classification'):
-    X = X.reset_index(drop=True)
+    '''
+    Train LGB model
+    '''
+    
+    X = X.fillna(0)
+    
+    if not np.isfinite(X).all().all():
+        for c in X.columns:
+            if not np.isfinite(X[c]).all():
+                max_ = X.loc[X[c] < np.inf][c].max()
+                min_ = X.loc[X[c] > -np.inf][c].min()
+                X.loc[X[c] == np.inf] = max_
+                X.loc[X[c] == -np.inf] = min_
+            
+    assert np.isfinite(X).all().all() == True
+    
     models = []
 
     oof = 0 * y.copy()
@@ -112,6 +127,7 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
         folds = folder.split(X, y)
     else:
         folds = folder.split(X, y, group_id)
+        
     for fold_, (trn_idx, val_idx) in tqdm(enumerate(folds)):
         print('Fold:', fold_)
 
@@ -137,7 +153,6 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
             clf = LGBMClassifier(objective='binary',
                                  boosting='gbdt',
                                  n_jobs=20,
-                                 max_depth=3,
                                  num_iterations=10 ** 6,
                                  learning_rate=0.02,
                                  random_state=0,
@@ -149,7 +164,6 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
             clf = LGBMRegressor(objective='regression',
                                 boosting='gbdt',
                                 n_jobs=20,
-                                max_depth=3,
                                 num_iterations=10 ** 6,
                                 learning_rate=0.02,
                                 random_state=0,
@@ -166,13 +180,13 @@ def gen_name():
 
 
 def lift_score(y_target, y_prediction, top=0.01):
-    df = pd.DataFrame({'y': y_target, 'y_pred': y_prediction})
+    df = pd.DataFrame({'y': y_target.tolist(), 'y_pred': y_prediction.tolist()})
     top_df = df.nlargest(int(df.shape[0] * top), 'y_pred')
     return top_df['y'].mean() / df['y'].mean()
 
 
 def precision_at_k(y_target, y_prediction, k=0.1):
-    df = pd.DataFrame({'y': y_target, 'y_pred': y_prediction})
+    df = pd.DataFrame({'y': y_target.tolist(), 'y_pred': y_prediction.tolist()})
     top_df = df.nlargest(int(df.shape[0] * k), 'y_pred')
     return precision_score(top_df['y'], np.ones(top_df.shape[0]))
 
@@ -248,7 +262,7 @@ class AutoML():
         print('Data shape: ', data_shape)
 
         if type(X) != pd.DataFrame:
-            X = pd.DataFrame(X, columns=[str(c) for c in range(X.shape[1])]).fillna(0)
+            X = pd.DataFrame(X, columns=[str(c) for c in range(X.shape[1])])
         if type(y) != pd.Series:
             y = pd.Series(y)
 
@@ -261,7 +275,7 @@ class AutoML():
         assert X.shape[0] == data_shape[0]
 
         cat_cols = []
-        X_check = X.copy()
+        X_check = X.reset_index(drop=True).copy()
         for column in tqdm(X.columns):
             if X_check[column].dtype == 'object':
                 cat_cols.append(column)
@@ -276,17 +290,18 @@ class AutoML():
             clf = LGBMRegressor(max_depth=-1, random_state=0, silent=True,
                                 metric='None', n_jobs=10, n_estimators=5000)
 
-        param_test = {'num_leaves': sp_randint(6, 50),
+        param_test = {'num_leaves': sp_randint(30, 100),
                       'min_child_samples': sp_randint(100, 500),
                       'min_child_weight': [1e-5, 1e-3, 1e-2, 1e-1, 1, 1e1, 1e2, 1e3, 1e4],
                       'subsample': sp_uniform(loc=0.2, scale=0.8),
                       'colsample_bytree': sp_uniform(loc=0.4, scale=0.6),
-                      'reg_alpha': [0, 1e-1, 1, 2, 5, 7, 10, 50, 100],
-                      'reg_lambda': [0, 1e-1, 1, 5, 10, 20, 50, 100]}
+                      'reg_alpha': [1e-1, 1, 2, 5, 7, 10, 50, 100],
+                      'reg_lambda': [1e-1, 1, 5, 10, 20, 50, 100],
+                      'max_depth': [3, 4, 5, 8, -1]}
         gs = RandomizedSearchCV(
             estimator=clf,
             param_distributions=param_test,
-            n_iter=100,
+            n_iter=10**2,
             scoring='roc_auc' if self.task_type == 'binary_classification' else make_scorer(mean_squared_error),
             cv=3,
             refit=True,
@@ -322,7 +337,8 @@ class AutoML():
             fold = StratifiedKFold(random_state=0, shuffle=False, n_splits=5)
         elif fold_strategy == 'GroupKFold':
             fold = GroupKFold(n_splits=5)
-        self.model, self.oof, self.train_data = train_model(X, y, gs.best_params_, fold, group_id=group_id)
+        self.model, self.oof, self.train_data = train_model(X.reset_index(drop=True), y.reset_index(drop=True),
+                                                            gs.best_params_, fold, group_id=group_id)
 
         print('Model trained! Success...')
 
@@ -443,7 +459,7 @@ class AutoML():
         return X[self.model[0]['teach_cols']]
 
     def plot_PR_curve(self, X_test, y_test,
-                      data_type='train',
+                      data_type='test',
                       title='All',
                       y_limit=1.0):
         '''Plot average precision chart'''
@@ -453,7 +469,7 @@ class AutoML():
         import matplotlib.pyplot as plt
         from funcsigs import signature
 
-        y_score = self.predict(X_test)
+        y_score = self.predict(X_test) if data_type != 'train' else self.oof.tolist()
         average_precision = average_precision_score(y_test, y_score)
         print('Average precision-recall score: {0:0.2f}'.format(average_precision))
         precision, recall, _ = precision_recall_curve(y_test, y_score)
@@ -486,7 +502,7 @@ class AutoML():
         @save => True by default, saves metrics to file
         @data_type => can be train or test
         '''
-        preds = self.predict(X)
+        preds = self.predict(X) if data_type != 'train' else self.oof
         metric_names = []
         metric_values = []
         comment = ''
