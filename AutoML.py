@@ -157,6 +157,7 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
                                  learning_rate=0.02,
                                  random_state=0,
                                  class_weight={0: np.mean(tr_y), 1: 1 - np.mean(tr_y)},
+                                 min_data_in_leaf=100,
                                  **clf_params).fit(tr_x, tr_y, eval_set=[(tr_x, tr_y), (vl_x, vl_y)],
                                                    early_stopping_rounds=50, verbose=100)
             oof[val_idx] = clf.predict_proba(vl_x)[:, 1]
@@ -167,6 +168,7 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
                                 num_iterations=10 ** 6,
                                 learning_rate=0.02,
                                 random_state=0,
+                                min_data_in_leaf=100,
                                 **clf_params).fit(tr_x, tr_y, eval_set=[(tr_x, tr_y), (vl_x, vl_y)],
                                                   early_stopping_rounds=50, verbose=100)
             oof[val_idx] = clf.predict(vl_x)
@@ -250,13 +252,14 @@ class AutoML():
             clf = pickle.load(fid)
         return clf
 
-    def fit(self, X, y, tune_params=True, fold_strategy='KFold', group_id=None):
+    def fit(self, X, y, tune_params=True, fold_strategy='KFold', group_id=None, tune_mode='easy'):
         '''
         Returns trained model and out of fold predictions
 
         @tune_params => whether we need to find optimal model paramets
         @fold_strategy => can be KFold (by default), StratifiedKFold, GroupKFold
                           For GroupKFold you need to specify unique id list, e.g. customers' id list
+        @tune_mode => can be 'easy' with 100 rounds for parameters search or 'hard' for 1000 rounds
         '''
         data_shape = X.shape
         print('Data shape: ', data_shape)
@@ -290,18 +293,18 @@ class AutoML():
             clf = LGBMRegressor(max_depth=-1, random_state=0, silent=True,
                                 metric='None', n_jobs=10, n_estimators=5000)
 
-        param_test = {'num_leaves': sp_randint(30, 100),
-                      'min_child_samples': sp_randint(100, 500),
-                      'min_child_weight': [1e-5, 1e-3, 1e-2, 1e-1, 1, 1e1, 1e2, 1e3, 1e4],
-                      'subsample': sp_uniform(loc=0.2, scale=0.8),
-                      'colsample_bytree': sp_uniform(loc=0.4, scale=0.6),
-                      'reg_alpha': [1e-1, 1, 2, 5, 7, 10, 50, 100],
-                      'reg_lambda': [1e-1, 1, 5, 10, 20, 50, 100],
+        param_test = {'num_leaves': [30, 50, 80, 100],
+                      'min_child_samples': [10, 50, 100, 200, 500],
+                      'min_child_weight': [1e-1, 1, 1e1, 1e2],
+                      'subsample': [0.5, 0.6, 0.7, 0.8, 0.9],
+                      'colsample_bytree': [0.5, 0.6, 0.7, 0.8, 0.9],
+                      'reg_alpha': [1e-1, 1, 2, 5, 10],
+                      'reg_lambda': [1e-1, 1, 2, 5, 10],
                       'max_depth': [3, 4, 5, 8, -1]}
         gs = RandomizedSearchCV(
             estimator=clf,
             param_distributions=param_test,
-            n_iter=10**2,
+            n_iter=100 if tune_mode == 'easy' else 1000,
             scoring='roc_auc' if self.task_type == 'binary_classification' else make_scorer(mean_squared_error),
             cv=3,
             refit=True,
@@ -317,7 +320,7 @@ class AutoML():
                                                                 y.copy(),
                                                                 test_size=0.33, random_state=0)
 
-        fit_params = {"early_stopping_rounds": 30,
+        fit_params = {"early_stopping_rounds": 5,
                       "eval_metric": 'auc' if self.task_type == 'binary_classification' else 'rmse',
                       "eval_set": [(X_test, y_test)],
                       'eval_names': ['valid'],
