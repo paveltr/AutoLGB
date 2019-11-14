@@ -34,6 +34,104 @@ def mean_absolute_percentage_error(y_true, y_pred):
     return np.mean(np.abs((y_true - y_pred) / (y_true + 1e-6)))
 
 
+def sd(col, max_loss_limit=0.001, avg_loss_limit=0.001, na_loss_limit=0, n_uniq_loss_limit=0, fillna=0):
+    """
+    max_loss_limit - don't allow any float to lose precision more than this value. Any values are ok for GBT algorithms as long as you don't unique values.
+                     See https://en.wikipedia.org/wiki/Half-precision_floating-point_format#Precision_limitations_on_decimal_values_in_[0,_1]
+    avg_loss_limit - same but calculates avg throughout the series.
+    na_loss_limit - not really useful.
+    n_uniq_loss_limit - very important parameter. If you have a float field with very high cardinality you can set this value to something like n_records * 0.01 in order to allow some field relaxing.
+    """
+    is_float = str(col.dtypes)[:5] == 'float'
+    na_count = col.isna().sum()
+    n_uniq = col.nunique(dropna=False)
+    try_types = ['float16', 'float32']
+
+    if na_count <= na_loss_limit:
+        try_types = ['int8', 'int16', 'float16', 'int32', 'float32']
+
+    for type in try_types:
+        col_tmp = col
+
+        # float to int conversion => try to round to minimize casting error
+        if is_float and (str(type)[:3] == 'int'):
+            col_tmp = col_tmp.copy().fillna(fillna).round()
+
+        col_tmp = col_tmp.astype(type)
+        max_loss = (col_tmp - col).abs().max()
+        avg_loss = (col_tmp - col).abs().mean()
+        na_loss = np.abs(na_count - col_tmp.isna().sum())
+        n_uniq_loss = np.abs(n_uniq - col_tmp.nunique(dropna=False))
+
+        if max_loss <= max_loss_limit and avg_loss <= avg_loss_limit and na_loss <= na_loss_limit and n_uniq_loss <= n_uniq_loss_limit:
+            return col_tmp
+
+    # field can't be converted
+    return col
+
+
+def reduce_mem_usage_sd(df, deep=True, verbose=False, obj_to_cat=False):
+    numerics = ['int16', 'uint16', 'int32', 'uint32', 'int64', 'uint64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage(deep=deep).sum() / 1024 ** 2
+    for col in df.columns:
+        col_type = df[col].dtypes
+
+        # collect stats
+        na_count = df[col].isna().sum()
+        n_uniq = df[col].nunique(dropna=False)
+        
+        # numerics
+        if col_type in numerics:
+            df[col] = sd(df[col])
+
+        # strings
+        if (col_type == 'object') and obj_to_cat:
+            df[col] = df[col].astype('category')
+        
+        if verbose:
+            print(f'Column {col}: {col_type} -> {df[col].dtypes}, na_count={na_count}, n_uniq={n_uniq}')
+        new_na_count = df[col].isna().sum()
+        if (na_count != new_na_count):
+            print(f'Warning: column {col}, {col_type} -> {df[col].dtypes} lost na values. Before: {na_count}, after: {new_na_count}')
+        new_n_uniq = df[col].nunique(dropna=False)
+        if (n_uniq != new_n_uniq):
+            print(f'Warning: column {col}, {col_type} -> {df[col].dtypes} lost unique values. Before: {n_uniq}, after: {new_n_uniq}')
+
+    end_mem = df.memory_usage(deep=deep).sum() / 1024 ** 2
+    percent = 100 * (start_mem - end_mem) / start_mem
+    print('Mem. usage decreased from {:5.2f} Mb to {:5.2f} Mb ({:.1f}% reduction)'.format(start_mem, end_mem, percent))
+    return df
+
+
+def reduce_mem_usage(df, verbose=True):
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage(deep=True).sum() / 1024 ** 2 # just added 
+    for col in df.columns:
+        col_type = df[col].dtypes
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)  
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)    
+    end_mem = df.memory_usage(deep=True).sum() / 1024 ** 2
+    percent = 100 * (start_mem - end_mem) / start_mem
+    print('Mem. usage decreased from {:5.2f} Mb to {:5.2f} Mb ({:.1f}% reduction)'.format(start_mem, end_mem, percent))
+    return df
+
 class TargetEncoderCV(BaseEstimator, TransformerMixin):
     '''
     Fold-based target encoder robust to overfitting
@@ -70,7 +168,7 @@ class TargetEncoderCV(BaseEstimator, TransformerMixin):
 
 def uncorrelate_df(df):
     fixed_columns = []
-    pearson = df.corr(method='pearson')
+    pearson = df.sample(n=df.shape[1] * 10, random_state=0).corr(method='pearson') if df.shape[0] > 10000 else df.corr(method='pearson')
     pca_encoder = {}
     for i, column in tqdm(enumerate(pearson.columns)):
         if column not in fixed_columns:
@@ -102,24 +200,28 @@ def pca_encode(X, pca_enc):
     return X
 
 
-def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_classification'):
+def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_classification',
+               id_list=[]):
     '''
     Train LGB model
+    @id_list => list of specific ids to exclude from prediction because model was trained on them
     '''
     
     X = X.fillna(0)
     
-    if not np.isfinite(X).all().all():
-        for c in X.columns:
+    cols = [c for c in X.columns if X[c].dtype != 'object']
+    if not np.isfinite(X[cols]).all().all():
+        for c in cols:
             if not np.isfinite(X[c]).all():
                 max_ = X.loc[X[c] < np.inf][c].max()
                 min_ = X.loc[X[c] > -np.inf][c].min()
                 X.loc[X[c] == np.inf] = max_
                 X.loc[X[c] == -np.inf] = min_
             
-    assert np.isfinite(X).all().all() == True
+    assert np.isfinite(X[cols]).all().all() == True
     
     models = []
+    id_list = np.array(id_list)
 
     oof = 0 * y.copy()
     encoded_data = []
@@ -146,34 +248,35 @@ def train_model(X, y, clf_params, folder, group_id=None, task_type='binary_class
             print('Categorical columns for target encoding: {}'.format(len(cat_cols)))
             print(cat_cols)
             te_cv = TargetEncoderCV(KFold(n_splits=3))
-            tr_x[cat_cols] = te_cv.fit_transform(tr_x[cat_cols].copy(), tr_y)
-            vl_x[cat_cols] = te_cv.transform(vl_x[cat_cols].copy())
+            tr_x[cat_cols] = te_cv.fit_transform(tr_x[cat_cols], tr_y)
+            vl_x[cat_cols] = te_cv.transform(vl_x[cat_cols])
 
         if task_type == 'binary_classification':
             clf = LGBMClassifier(objective='binary',
                                  boosting='gbdt',
+                                 metric='auc',
                                  n_jobs=20,
                                  num_iterations=10 ** 6,
                                  learning_rate=0.02,
                                  random_state=0,
                                  class_weight={0: np.mean(tr_y), 1: 1 - np.mean(tr_y)},
-                                 min_data_in_leaf=100,
                                  **clf_params).fit(tr_x, tr_y, eval_set=[(tr_x, tr_y), (vl_x, vl_y)],
                                                    early_stopping_rounds=50, verbose=100)
             oof[val_idx] = clf.predict_proba(vl_x)[:, 1]
         elif task_type == 'regression':
             clf = LGBMRegressor(objective='regression',
                                 boosting='gbdt',
+                                metric='rmse',
                                 n_jobs=20,
                                 num_iterations=10 ** 6,
                                 learning_rate=0.02,
                                 random_state=0,
-                                min_data_in_leaf=100,
                                 **clf_params).fit(tr_x, tr_y, eval_set=[(tr_x, tr_y), (vl_x, vl_y)],
                                                   early_stopping_rounds=50, verbose=100)
             oof[val_idx] = clf.predict(vl_x)
         encoded_data.append(vl_x)
-        models.append({'clf': clf, 'teach_cols': X.columns, 'encoder': te_cv, 'cat_cols': cat_cols})
+        models.append({'clf': clf, 'teach_cols': X.columns, 'encoder': te_cv, 'cat_cols': cat_cols,
+                       'train_ids': id_list[trn_idx] if len(id_list) > 0 else []})
     return models, oof, pd.DataFrame(np.vstack(encoded_data), columns=X.columns)
 
 
@@ -202,6 +305,7 @@ class AutoML():
                  task_type='binary_classification',
                  save_models=True,
                  save_metrics=True,
+                 model_name = 'Model'
                  ):
         '''
         Initialize AutoML class
@@ -217,6 +321,7 @@ class AutoML():
         self.save_metrics = save_metrics
         self.model = None
         self.oof = None
+        self.model_name = model_name
         self.train_metrics = 'automl/metrics'
         self.train_features = 'automl/train/features'
         self.test_metrics = 'automl/test/metrics'
@@ -240,7 +345,7 @@ class AutoML():
         '''
         Saved model to disk
         '''
-        with open(self.model_path + '/' + gen_name() + '_model.pkl', 'wb') as pfile:
+        with open(self.model_path + '/' + gen_name() + '_' + self.model_name + '_model.pkl', 'wb') as pfile:
             pickle.dump(self, pfile, protocol=pickle.HIGHEST_PROTOCOL)
 
     def load(self, path_to_model):
@@ -252,7 +357,8 @@ class AutoML():
             clf = pickle.load(fid)
         return clf
 
-    def fit(self, X, y, tune_params=True, fold_strategy='KFold', group_id=None, tune_mode='easy'):
+    def fit(self, X, y, tune_params=True, fold_strategy='KFold', group_id=None, tune_mode='easy',
+            id_list=[], manual_params = None):
         '''
         Returns trained model and out of fold predictions
 
@@ -260,15 +366,21 @@ class AutoML():
         @fold_strategy => can be KFold (by default), StratifiedKFold, GroupKFold
                           For GroupKFold you need to specify unique id list, e.g. customers' id list
         @tune_mode => can be 'easy' with 100 rounds for parameters search or 'hard' for 1000 rounds
+        @id_list => list of specific ids to exclude from prediction because model was trained on them
         '''
         data_shape = X.shape
         print('Data shape: ', data_shape)
+        
+        if len(id_list) > 0:
+            assert len(id_list) == data_shape
 
         if type(X) != pd.DataFrame:
             X = pd.DataFrame(X, columns=[str(c) for c in range(X.shape[1])])
         if type(y) != pd.Series:
             y = pd.Series(y)
-
+        y = y.reset_index(drop=True)
+        # reduct memory comsumption
+        X = reduce_mem_usage_sd(X)
         # merge correlated features into one single feature
         X_pca, self.pca_enc = uncorrelate_df(X[[c for c in X.columns if X[c].dtype != 'object']])
         X = pd.concat([X_pca,
@@ -276,61 +388,8 @@ class AutoML():
         del X_pca
         gc.collect()
         assert X.shape[0] == data_shape[0]
-
-        cat_cols = []
-        X_check = X.reset_index(drop=True).copy()
-        for column in tqdm(X.columns):
-            if X_check[column].dtype == 'object':
-                cat_cols.append(column)
-        print('Categorical columns: ', cat_cols)
-        X_check[cat_cols] = TargetEncoderCV(KFold(n_splits=3)).fit_transform(X_check[cat_cols].copy(), y)
-
-        # set up model parameters
-        if self.task_type == 'binary_classification':
-            clf = LGBMClassifier(max_depth=-1, random_state=0, silent=True,
-                                 metric='None', n_jobs=10, n_estimators=5000)
-        elif self.task_type == 'regression':
-            clf = LGBMRegressor(max_depth=-1, random_state=0, silent=True,
-                                metric='None', n_jobs=10, n_estimators=5000)
-
-        param_test = {'num_leaves': [30, 50, 80, 100],
-                      'min_child_samples': [10, 50, 100, 200, 500],
-                      'min_child_weight': [1e-1, 1, 1e1, 1e2],
-                      'subsample': [0.5, 0.6, 0.7, 0.8, 0.9],
-                      'colsample_bytree': [0.5, 0.6, 0.7, 0.8, 0.9],
-                      'reg_alpha': [1e-1, 1, 2, 5, 10],
-                      'reg_lambda': [1e-1, 1, 2, 5, 10],
-                      'max_depth': [3, 4, 5, 8, -1]}
-        gs = RandomizedSearchCV(
-            estimator=clf,
-            param_distributions=param_test,
-            n_iter=100 if tune_mode == 'easy' else 1000,
-            scoring='roc_auc' if self.task_type == 'binary_classification' else make_scorer(mean_squared_error),
-            cv=3,
-            refit=True,
-            random_state=0,
-            verbose=False)
-        if X.shape[0] >= 20000:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_check.fillna(0).sample(n=X.shape[1] * 10, random_state=0).copy(),
-                y.sample(n=X.shape[1] * 10, random_state=0).copy(),
-                test_size=0.33, random_state=0)
-        else:
-            X_train, X_test, y_train, y_test = train_test_split(X_check.fillna(0).copy(),
-                                                                y.copy(),
-                                                                test_size=0.33, random_state=0)
-
-        fit_params = {"early_stopping_rounds": 5,
-                      "eval_metric": 'auc' if self.task_type == 'binary_classification' else 'rmse',
-                      "eval_set": [(X_test, y_test)],
-                      'eval_names': ['valid'],
-                      'verbose': 0,
-                      'categorical_feature': 'auto'}
-
-        gs.fit(X_train, y_train, **fit_params)
-        print('Parameters optimization best score reached: {} with params: {} ' \
-              .format(gs.best_score_, gs.best_params_))
-
+        
+        
         # train model
         if fold_strategy not in ['KFold', 'StratifiedKFold', 'GroupKFold']:
             raise Exception("fold_strategy parameter needs to be in ['KFold', 'StratifiedKFold', 'GroupKFold']")
@@ -340,8 +399,75 @@ class AutoML():
             fold = StratifiedKFold(random_state=0, shuffle=False, n_splits=5)
         elif fold_strategy == 'GroupKFold':
             fold = GroupKFold(n_splits=5)
-        self.model, self.oof, self.train_data = train_model(X.reset_index(drop=True), y.reset_index(drop=True),
-                                                            gs.best_params_, fold, group_id=group_id)
+        
+        if not manual_params:
+            cat_cols = []
+            X_check = X.reset_index(drop=True).copy()
+            for column in tqdm(X.columns):
+                if X_check[column].dtype == 'object':
+                    cat_cols.append(column)
+            print('Categorical columns: ', cat_cols)
+            X_check[cat_cols] = TargetEncoderCV(KFold(n_splits=3)).fit_transform(X_check[cat_cols], y)
+
+            # set up model parameters
+            if self.task_type == 'binary_classification':
+                clf = LGBMClassifier(max_depth=-1, random_state=0, silent=True,
+                                     metric='None', n_jobs=10, n_estimators=5000)
+            elif self.task_type == 'regression':
+                clf = LGBMRegressor(max_depth=-1, random_state=0, silent=True,
+                                    metric='None', n_jobs=10, n_estimators=5000)
+
+            param_test = {'num_leaves': [30, 50, 80, 100],
+                          'min_child_samples': [100, 200, 500],
+                          'min_child_weight': [1, 5, 10],
+                          'subsample': [0.5, 0.6, 0.7, 0.8, 0.9],
+                          'colsample_bytree': [0.5, 0.6, 0.7, 0.8, 0.9],
+                          'reg_alpha': [1, 2, 5, 10],
+                          'reg_lambda': [1, 2, 5, 10],
+                          'max_depth': [3, 4, 5, 8]}
+            gs = RandomizedSearchCV(
+                estimator=clf,
+                param_distributions=param_test,
+                n_iter=100 if tune_mode == 'easy' else 1000,
+                scoring='roc_auc' if self.task_type == 'binary_classification' else make_scorer(mean_squared_error),
+                cv=3,
+                refit=True,
+                random_state=0,
+                verbose=False)
+            if X.shape[0] >= 20000:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_check.fillna(0).sample(n=X.shape[1] * 10, random_state=0).copy(),
+                    y.sample(n=X.shape[1] * 10, random_state=0).copy(),
+                    test_size=0.33, random_state=0)
+            else:
+                X_train, X_test, y_train, y_test = train_test_split(X_check.fillna(0).copy(),
+                                                                    y.copy(),
+                                                                    test_size=0.33, random_state=0)
+
+            fit_params = {"early_stopping_rounds": 5,
+                          "eval_metric": 'auc' if self.task_type == 'binary_classification' else 'rmse',
+                          "eval_set": [(X_test, y_test)],
+                          'eval_names': ['valid'],
+                          'verbose': 0,
+                          'categorical_feature': 'auto'}
+
+            assert np.isfinite(X_train).all().all()
+            assert ~np.isnan(X_train).all().all()
+
+            assert np.isfinite(X_test).all().all()
+            assert ~np.isnan(X_test).all().all()
+
+            gs.fit(X_train, y_train, **fit_params)
+            print('Parameters optimization best score reached: {} with params: {} ' \
+                  .format(gs.best_score_, gs.best_params_))
+        
+            self.model, self.oof, self.train_data = train_model(X.reset_index(drop=True), y.reset_index(drop=True),
+                                                                gs.best_params_, fold, group_id=group_id,
+                                                                id_list=id_list)
+        else:
+            self.model, self.oof, self.train_data = train_model(X.reset_index(drop=True), y.reset_index(drop=True),
+                                                                manual_params, fold, group_id=group_id,
+                                                                id_list=id_list)
 
         print('Model trained! Success...')
 
@@ -373,7 +499,7 @@ class AutoML():
                 title='Feature Importance Plot',
                 show=not save
             )
-            plt.savefig(self.train_features + '/' + gen_name() + '_feature_importance.png')
+            plt.savefig(self.train_features + '/' + gen_name() + '_' + self.model_name + '_feature_importance.png')
         else:
             shap.summary_plot(
                 np.vstack(shaps),
@@ -391,7 +517,7 @@ class AutoML():
         shap_importance = pd.DataFrame(shap_importance, columns=['feature', 'weight'])
         shap_importance = shap_importance.groupby('feature')['weight'].sum().reset_index()
         shap_importance = shap_importance.sort_values(by=['weight'], ascending=False).reset_index(drop=True)
-        shap_importance.to_csv(self.train_features + '/' + gen_name() + '_feature_importance.csv', index=False,
+        shap_importance.to_csv(self.train_features + '/' + gen_name() + '_' + self.model_name + '_feature_importance.csv', index=False,
                                sep=';', decimal=',')
 
     def explain_data(self, df, save=False, n_features=30):
@@ -421,7 +547,7 @@ class AutoML():
                 title='Feature Importance Plot',
                 show=not save
             )
-            plt.savefig(self.test_features + '/' + gen_name() + '_feature_importance.png')
+            plt.savefig(self.test_features + '/' + gen_name() + '_' + self.model_name + '_feature_importance.png')
         else:
             shap.summary_plot(
                 np.vstack(shaps),
@@ -439,7 +565,7 @@ class AutoML():
         shap_importance = pd.DataFrame(shap_importance, columns=['feature', 'weight'])
         shap_importance = shap_importance.groupby('feature')['weight'].sum().reset_index()
         shap_importance = shap_importance.sort_values(by=['weight'], ascending=False).reset_index(drop=True)
-        shap_importance.to_csv(self.test_features + '/' + gen_name() + '_feature_importance.csv', index=False,
+        shap_importance.to_csv(self.test_features + '/' + gen_name() + '_' + self.model_name + '_feature_importance.csv', index=False,
                                sep=';', decimal=',')
 
     def process_data(self, X):
@@ -458,8 +584,8 @@ class AutoML():
             for m in tqdm(self.model):
                 encoder = m['encoder']
                 if encoder is not None:
-                    X[m['cat_cols']] += encoder.transform(X_cat[cat_cols].copy()) / len(self.model)
-        return X[self.model[0]['teach_cols']]
+                    X[m['cat_cols']] += encoder.transform(X_cat[m['cat_cols']].copy()) / len(self.model)
+        return X[self.model[0]['teach_cols']].reset_index(drop=True)
 
     def plot_PR_curve(self, X_test, y_test,
                       data_type='test',
@@ -505,7 +631,7 @@ class AutoML():
         @save => True by default, saves metrics to file
         @data_type => can be train or test
         '''
-        preds = self.predict(X) if data_type != 'train' else self.oof
+        preds = self.predict(X.copy()) if data_type != 'train' else self.oof
         metric_names = []
         metric_values = []
         comment = ''
@@ -545,29 +671,38 @@ class AutoML():
 
         if save:
             if data_type == 'train':
-                metrics_df.to_csv(self.train_metrics + '/' + gen_name() + '_metrics.csv', index=False,
+                metrics_df.to_csv(self.train_metrics + '/' + gen_name() + '_' + self.model_name + '_metrics.csv', index=False,
                                   sep=';', decimal=',')
             elif data_type == 'test':
-                metrics_df.to_csv(self.test_metrics + '/' + gen_name() + '_metrics.csv', index=False,
+                metrics_df.to_csv(self.test_metrics + '/' + gen_name() + '_' + self.model_name + '_metrics.csv', index=False,
                                   sep=';', decimal=',')
             else:
                 raise Exception("data_type should be one of values ['train', 'test']")
         print(comment)
         return metrics_df
 
-    def predict(self, X):
+    def predict(self, X, id_list=[]):
         '''
         Makes predictions
         @X => dataframe with features
+        @id_list => list of specific ids to exclude from prediction because model was trained on them
         '''
         data = self.process_data(X.copy()).fillna(0)
-        preds = np.zeros(X.shape[0])
+        preds = pd.Series(np.zeros(X.shape[0])) # predictions
+        counters = pd.Series(np.zeros(X.shape[0])) # count of number of predictions
+        id_list=pd.Series(id_list)
         for m in tqdm(self.model):
+            except_list = id_list[id_list.isin(m['train_ids'])].index.tolist()
             if self.task_type == 'binary_classification':
-                preds += m['clf'].predict_proba(data[m['teach_cols']])[:, 1] / len(self.model)
+                preds[~preds.index.isin(except_list)] += \
+                        m['clf'].predict_proba(data\
+                                               .loc[~data.index.isin(except_list)][m['teach_cols']])[:, 1]
             elif self.task_type == 'regression':
-                preds += m['clf'].predict(data[m['teach_cols']]) / len(self.model)
-        return preds
+                preds[~preds.index.isin(except_list)] += \
+                        m['clf'].predict(data\
+                                         .loc[~data.index.isin(except_list)][m['teach_cols']])
+            counters[~counters.index.isin(except_list)] += 1
+        return preds / counters
 
     def check_test_data(self, X):
         '''
